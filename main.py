@@ -1,9 +1,11 @@
 
 # coding: utf-8
 
-# # Data
+# # Chicago Crime Statistics
 # 
-# ### Source: https://www.kaggle.com/currie32/crimes-in-chicago/data
+# ## Data
+# 
+# ### Chicago Crime [Source: https://www.kaggle.com/currie32/crimes-in-chicago/data]
 # Crimes in Chicago from 2001 to 2017 (1.85GB)
 # 
 # This data is broken up into 4 files:<br>
@@ -12,9 +14,11 @@
 # Chicago_Crimes_2008_to_2011.csv<br>
 # Chicago_Crimes_2012_to_2017.csv<br>
 # 
+# ### Community Areas [Source: https://data.cityofchicago.org/Facilities-Geographic-Boundaries/Boundaries-Community-Areas-current-/cauq-8yn6]
+# Fairly small csv (CommAreas.csv), provides Name of the community that can be tied back to Chicago Crimes csvs. 
 # 
 
-# In[20]:
+# In[9]:
 
 
 from pyspark.sql import functions as func
@@ -22,56 +26,119 @@ from pyspark.sql.types import StringType
 import matplotlib.pyplot as plt
 import pandas
 
-
-FILE_PATH = "hdfs://sandbox.hortonworks.com:8020/bigdata1_final_project/Chicago_Crimes_*.csv"
-
-crime_df = sqlContext.read.load(FILE_PATH,
+def print_cols_types(df):
+    print("Columns:")
+    for f in df.schema.fields:
+        print("%s (%s)" % (f.name, f.dataType))
+    print('+--------------------------------+')
+    
+areas_df = sqlContext.read.load("hdfs://sandbox.hortonworks.com:8020/bigdata1_final_project/CommAreas.csv",
                         format='com.databricks.spark.csv',
                         header='true',
                         inferSchema=True)
-print("Loaded DataFrame")
+print_cols_types(areas_df)
 
-# Columns and data types
 
-print("Columns:")
-for f in crime_df.schema.fields:
-    print("%s (%s)" % (f.name, f.dataType))
-print('+--------------------------------+')
+crime_df = sqlContext.read.load("hdfs://sandbox.hortonworks.com:8020/bigdata1_final_project/Chicago_Crimes_*.csv",
+                        format='com.databricks.spark.csv',
+                        header='true',
+                        inferSchema=True)
+print_cols_types(crime_df)
 
-crime_df.select("Primary Type").distinct().sort("Primary Type").show(200, False)
 
-print("Cleaning Primary Type")
+# # Clean Up
+# ### Clean up Primary Type Column
+# Some of the Primary Types had similar names that can be combined into one Primary Type.
+
+# In[10]:
+
+
 def clean_primary_types(val):
+    """UDF function to fix duplicate primary types"""
     if val in ("NON - CRIMINAL", "NON-CRIMINAL", "NON-CRIMINAL (SUBJECT SPECIFIED)"):
         return "NON-CRIMINAL"
     if "NARCOTIC" in val:
         return "NARCOTICS"
     return val
 
-clean_primary_types_udf = func.udf(clean_primary_types, StringType())
 
-crime_df = crime_df.withColumn("Primary Type", clean_primary_types_udf(crime_df["Primary Type"]))
-
+# Show current Primary Types
 crime_df.select("Primary Type").distinct().sort("Primary Type").show(200, False)
 
-# TODO: convert Date into Date Type
+clean_primary_types_udf = func.udf(clean_primary_types, StringType())
+crime_df = crime_df.withColumn("Primary Type", clean_primary_types_udf(crime_df["Primary Type"]))
+
+# Show cleaned Primary Types
+crime_df.select("Primary Type").distinct().sort("Primary Type").show(200, False)
+
+
+# ### Clean up District Column
+# 
+
+# In[11]:
+
+
+crime_df.select("District").distinct().sort("District").show(200, False)
+
+# integer cast will return null for string values like Beat
+crime_df = crime_df.withColumn("District", crime_df["District"].cast("integer"))
+# now remove any nulls
+crime_df = crime_df.filter(crime_df["District"].isNotNull())
+
+crime_df.select("District").distinct().sort("District").show(200, False)
 
 
 # ### Clean up Year Column
 # 
-# There were some bad columns that did not contain valid years.
+# There were some bad rows that did not contain valid years.
 # I also chose to remove data for 2017 as it was incomplete and ended up being outliner in all of the analysis.
 # 
 
-# In[21]:
+# In[12]:
 
 
 crime_df.select("Year").distinct().show()
 
 # clean
-valid_years = list(range(2001, 2017))  # 2001 to 2016
+valid_years = list(range(2002, 2017))  # 2002 to 2016
 crime_df = crime_df.filter(crime_df.Year.isin(valid_years))
+
 print("Done cleaning year data...")
+
+crime_df.select("Year").distinct().show()
+
+
+# ### Join Community Areas
+
+# In[13]:
+
+
+areas_df = areas_df.select(areas_df["AREA_NUM_1"].alias("Community Area"), 
+                           areas_df["COMMUNITY"].alias("Community Description"))
+
+crime_df = crime_df.join(areas_df, "Community Area")
+crime_df.show(1)
+
+
+# ### Are there duplicates?
+# Check for any duplicate rows, and drop if any.
+
+# In[21]:
+
+
+# print(crime_df.count()) => 7227632
+# print(crime_df.dropDuplicates().count()) => 5543285
+
+
+# In[14]:
+
+
+# print(crime_df.rdd.getNumPartitions())
+# crime_df = crime_df.dropDuplicates()
+# print(crime_df.rdd.getNumPartitions())
+
+# crime_df = crime_df.coalesce(16)
+# print(crime_df.rdd.getNumPartitions())
 
 
 # # Location Analysis
@@ -80,7 +147,7 @@ print("Done cleaning year data...")
 # After grouping crime by location descriptions, I selected records with a count of one.
 # These are the ones I defined as "unique locations".
 
-# In[22]:
+# In[7]:
 
 
 # Group by location descriptions
@@ -100,7 +167,7 @@ filtered_df.select(
 
 # ## Top 10 Most Common Crime Location Descriptions
 
-# In[23]:
+# In[27]:
 
 
 location_counts_sorted_df = location_all_counts_df.sort("count", ascending=False).limit(10)
@@ -118,7 +185,7 @@ plt.show()
 # ## Homicides Per Year
 # http://www.newsweek.com/2016/12/23/chicago-gangs-violence-murder-rate-532034.html
 
-# In[24]:
+# In[28]:
 
 
 homicide_per_year_df = crime_df.filter(crime_df["Primary Type"] == 'HOMICIDE').groupBy("Year").count().sort(
@@ -134,7 +201,7 @@ plt.show()
 # ## Crimes Per Year
 # Shows number of crimes reported by year.
 
-# In[25]:
+# In[29]:
 
 
 crime_per_year_df = crime_df.groupBy("Year").count().sort("Year")
@@ -149,7 +216,7 @@ plt.show()
 # # Arrests Per Year
 # Shows number of actual arrests made by year. Not every crime reported resulted in an arrest. Sorted by years with highest arrest number.
 
-# In[26]:
+# In[30]:
 
 
 arrests_per_year_df = crime_df.where(crime_df.Arrest == "True").groupBy("Year").count().sort("Year")
@@ -165,7 +232,7 @@ plt.show()
 # Calculate ratio of actual arrests from reported crime.
 # Create two separate data frames containing year and counts, one with all crimes (all rows) and second with rows that have Arrest => true.
 
-# In[27]:
+# In[31]:
 
 
 # Collect Year and Count with crimes that had arrests
@@ -192,7 +259,7 @@ ratio_df.show()
 # https://chicago.suntimes.com/chicago-politics/the-watchdogs-arrests-down-25-percent-in-chicago-this-year/
 # https://www.google.com/search?q=chicago+arrests+down+in+2016&oq=chicago+arrests+down+in+2016&aqs=chrome..69i57.5702j0j4&sourceid=chrome&ie=UTF-8
 
-# In[28]:
+# In[32]:
 
 
 pdf = ratio_df.sort("Year").toPandas()
@@ -203,7 +270,7 @@ plt.show()
 
 # # Top Crimes per Year
 
-# In[37]:
+# In[33]:
 
 
 year_max_cnt_df = crime_df.groupBy("Year", "Primary Type").count().groupBy("Year").agg(
@@ -214,7 +281,7 @@ year_type_count_df.join(year_max_cnt_df, ["count", "Year"]).sort("Year").show()
 
 # # Least Crimes per Year
 
-# In[38]:
+# In[34]:
 
 
 year_max_cnt_df = crime_df.groupBy("Year", "Primary Type").count().groupBy("Year").agg(
@@ -227,7 +294,7 @@ year_type_count_df.join(year_max_cnt_df, ["count", "Year"]).sort("Year").show()
 # Top 10 crimes, all years.
 # Collect count of each crime type per year, then take an average of counts to get top 10 crimes.
 
-# In[39]:
+# In[35]:
 
 
 temp_df = crime_df.groupBy("Year", "Primary Type").count().groupBy("Primary Type").agg(
@@ -239,7 +306,7 @@ temp_df.sort("Avg Count", ascending=False).limit(10).show()
 # Top 10 crimes, all years that resulted in arrests.
 # Collect count of each crime type per year that had Arrests=True, then take an average of counts to get top 10 crimes.
 
-# In[40]:
+# In[37]:
 
 
 temp_df = crime_df.where(crime_df.Arrest == "True").groupBy("Year", "Primary Type").count().groupBy("Primary Type").agg(
@@ -252,7 +319,7 @@ temp_df.sort("Avg Count", ascending=False).limit(10).show()
 # Calculates counts of crimes per date, then take an average of those counts to determine safest / most dangerous hour.
 # 
 
-# In[41]:
+# In[38]:
 
 
 date_format = "MM/dd/yyyy hh:mm:ss a"
@@ -267,18 +334,17 @@ by_hour_df = crime_df.select(
 by_hour_df.show(24, False)
 
 
-# In[42]:
+# In[46]:
 
 
 pdf = by_hour_df.sort("JustHour").toPandas()
 pdf.plot(kind='line', x='JustHour', y='AvgCount', colormap='terrain')
-plt.ylabel('bar')
 plt.show()
 
 
 # ## Time of Day to Crime Rates (Homicide, Burglary, Arson, Theft)
 
-# In[43]:
+# In[14]:
 
 
 date_format = "MM/dd/yyyy hh:mm:ss a"
@@ -293,29 +359,61 @@ for pri_type in ("HOMICIDE", "BURGLARY", "ARSON", "THEFT"):
     plt.show()
 
 
-# # Crimes by Districts
+# # Crimes by Districts / Community
+# 
+# http://gis.chicagopolice.org/website/ClearMap/viewer.htm?POLICEDIST=011
 # 
 # <img src="http://chronicle.uchicago.edu/991104/map.gif">
+# <img src="https://home.chicagopolice.org/wp-content/uploads/2014/11/communitymap_preview.png">
+# 
 
-# In[44]:
+# In[15]:
 
 
-by_district_df = crime_df.filter(crime_df["District"].isNotNull()).groupBy(crime_df["District"]).count()
+by_district_df = crime_df.groupBy(crime_df["District"]).agg(
+    func.count(crime_df.ID).alias("count"), func.collect_set(crime_df["Community Description"]).alias("communities"))
+by_district_df.show(1, False)
+
+# From output we can see that communities don't map correctly to districts; don't use it.
 
 print("*** Top 5 Low Crime Districts ***")
-by_district_df.sort("count").select(crime_df["District"].cast("integer"), "count").limit(5).show()
+by_district_df.sort("count").select(crime_df["District"].cast("integer"), "count").limit(5).show(10, False)
+
 print("*** Top 10 High Crime Districts ***")
-by_district_df.sort("count", ascending=False).select(crime_df["District"].cast("integer"), "count").limit(10).show()
+by_district_df.sort("count", ascending=False).select(
+    crime_df["District"].cast("integer"), "count").limit(10).show(10, False)
 
 
+# In[16]:
 
-# In[45]:
 
-
-homicide_by_district_df = crime_df.filter(crime_df["District"].isNotNull()).filter(
+homicide_by_district_df = crime_df.filter(
     crime_df["Primary Type"] == "HOMICIDE").groupBy(crime_df["District"]).count()
+
 print("*** Top 5 Low Homicide Districts ***")
 homicide_by_district_df.sort("count").select(crime_df["District"].cast("integer"), "count").limit(5).show()
+
 print("*** Top 10 High Homicide Districts ***")
-homicide_by_district_df.sort("count", ascending=False).select(crime_df["District"].cast("integer"), "count").limit(10).show()
+homicide_by_district_df.sort("count", ascending=False).select(
+    crime_df["District"].cast("integer"), "count").limit(10).show()
+
+
+# https://www.themarshallproject.org/2016/09/20/the-most-dangerous-neighborhood-the-most-inexperienced-cops
+# <blockquote>
+# The officers who patrol the Chicago’s 11th Police District face a daunting challenge. The district, which is centered around Garfield Park on the city’s West Side, has the highest murder rate in the city, and it’s rising fast.
+# </blockquote>
+
+# ### Community areas with Most / Least Homicides
+
+# In[18]:
+
+
+homicide_by_comm_desrc_df = crime_df.filter(
+    crime_df["Primary Type"] == "HOMICIDE").groupBy(crime_df["Community Description"]).count()
+
+print("*** Top 3 Low Homicide Community ***")
+homicide_by_comm_desrc_df.sort("count").limit(3).show()
+
+print("*** Top 3 High Homicide Community ***")
+homicide_by_comm_desrc_df.sort("count", ascending=False).limit(5).show()
 
